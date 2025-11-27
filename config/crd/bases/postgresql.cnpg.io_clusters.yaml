@@ -6421,6 +6421,17 @@ spec:
                 description: ID of the latest generated node (used to avoid node name
                   clashing)
                 type: integer
+              majorUpgradeStatus:
+                description: MajorUpgradeStatus is the status of major upgrade phase
+                properties:
+                  postUpgradeBackupName:
+                    description: Name of the backup to be taken after upgrade, but
+                      before starting replicas
+                    type: string
+                  preUpgradeInstanceCount:
+                    description: PreUpgradeInstanceCount keeps initial instance count
+                    type: integer
+                type: object
               managedRolesStatus:
                 description: ManagedRolesStatus reports the state of the managed roles
                   in the cluster

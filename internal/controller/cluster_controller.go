@@ -806,6 +806,7 @@ func (r *ClusterReconciler) reconcileResources(
 		resources.instances.Items,
 		resources.pvcs.Items,
 		resources.jobs.Items,
+		resources.noInstanceIsAlive(),
 	); err != nil {
 		return ctrl.Result{}, fmt.Errorf("cannot reconcile in-place major version upgrades: %w", err)
 	} else if result != nil {
@@ -997,14 +998,19 @@ func (r *ClusterReconciler) reconcilePods(
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, ErrNextLoop
 	}
 
+	waitingForPostUpgradeBackup := cluster.Status.MajorUpgradeStatus.PostUpgradeBackupName != ""
+
 	// Are there missing nodes? Let's create one
 	if cluster.Status.Instances < cluster.Spec.Instances &&
-		instancesStatus.InstancesReportingStatus() == cluster.Status.Instances {
+		instancesStatus.InstancesReportingStatus() == cluster.Status.Instances &&
+		!waitingForPostUpgradeBackup {
 		newNodeSerial, err := r.generateNodeSerial(ctx, cluster)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("cannot generate node serial: %w", err)
 		}
 		return r.joinReplicaInstance(ctx, newNodeSerial, cluster)
+	} else if waitingForPostUpgradeBackup {
+		contextLogger.Debug("Not creating additional instances until backup is complete")
 	}
 
 	// Are there nodes to be removed? Remove one of them

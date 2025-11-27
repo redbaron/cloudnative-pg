@@ -56,6 +56,7 @@ type managedResources struct {
 	instances corev1.PodList
 	pvcs      corev1.PersistentVolumeClaimList
 	jobs      batchv1.JobList
+	backups   apiv1.BackupList
 }
 
 // Count the number of jobs that are still running

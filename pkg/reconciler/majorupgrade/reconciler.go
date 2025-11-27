@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cloudnative-pg/cloudnative-pg/pkg/resources"
 	"github.com/cloudnative-pg/machinery/pkg/log"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -57,6 +58,7 @@ func Reconcile(
 	instances []corev1.Pod,
 	pvcs []corev1.PersistentVolumeClaim,
 	jobs []batchv1.Job,
+	noInstanceIsAlive bool,
 ) (*ctrl.Result, error) {
 	contextLogger := log.FromContext(ctx)
 
@@ -64,14 +66,20 @@ func Reconcile(
 		return majorVersionUpgradeHandleCompletion(ctx, c, cluster, majorUpgradeJob, pvcs)
 	}
 
+	if err := postUpgradeBackupCompletion(ctx, c, cluster, noInstanceIsAlive); err != nil {
+		return nil, err
+	}
+
 	requestedMajor, err := cluster.GetPostgresqlMajorVersion()
 	if err != nil {
 		contextLogger.Error(err, "Unable to retrieve the requested PostgreSQL version")
 		return nil, err
 	}
+
 	if cluster.Status.PGDataImageInfo == nil || requestedMajor <= cluster.Status.PGDataImageInfo.MajorVersion {
 		return nil, nil
 	}
+	// If we are here, upgrade job didn't complete yet
 
 	primaryNodeSerial, err := getPrimarySerial(pvcs)
 	if err != nil || primaryNodeSerial == 0 {
@@ -95,6 +103,13 @@ func Reconcile(
 		return result, err
 	}
 
+	if result, err := registerPostUpgradeBackup(ctx, c, cluster, primaryNodeSerial); err != nil {
+		contextLogger.Error(err, "Unable to create post-upgrade backup")
+		return nil, err
+	} else if result != nil {
+		return result, err
+	}
+
 	if result, err := createMajorUpgradeJob(ctx, c, cluster, primaryNodeSerial); err != nil {
 		contextLogger.Error(err, "Unable to create major upgrade job")
 		return nil, err
@@ -113,6 +128,24 @@ func getMajorUpdateJob(items []batchv1.Job) *batchv1.Job {
 	}
 
 	return nil
+}
+
+func getPostUpgradeBackup(ctx context.Context, c client.Client, cluster *apiv1.Cluster) (*apiv1.Backup, error) {
+	backupName := cluster.Status.MajorUpgradeStatus.PostUpgradeBackupName
+	if backupName == "" {
+		return nil, nil
+	}
+
+	var backup apiv1.Backup
+	backupObjectKey := client.ObjectKey{
+		Namespace: cluster.Namespace,
+		Name:      backupName,
+	}
+	err := c.Get(ctx, backupObjectKey, &backup)
+	if err != nil {
+		return nil, err
+	}
+	return &backup, nil
 }
 
 func deleteAllPodsInMajorUpgradePreparation(
@@ -151,6 +184,91 @@ func deleteAllPodsInMajorUpgradePreparation(
 		return &ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
+	return nil, nil
+}
+
+func registerPostUpgradeBackup(ctx context.Context, c client.Client, cluster *apiv1.Cluster, nodeSerial int) (*ctrl.Result, error) {
+	contextLogger := log.FromContext(ctx)
+	_, ok := chooseBackupMethod(cluster)
+	if !ok {
+		contextLogger.Debug("Skipping configuring post-upgrade backup, because unable to determine backup method")
+		return nil, nil
+	}
+
+	var backupName string
+	// Write status once, being careful not to erase original instances count if we happen to retry
+	// registerPostUpgradeBackup call
+	if cluster.Status.MajorUpgradeStatus.PostUpgradeBackupName == "" {
+		instanceName := specs.GetInstanceName(cluster.Name, nodeSerial)
+		backupName = fmt.Sprintf("%s-%s", instanceName, "post-upgrade-backup")
+
+		if err := status.PatchWithOptimisticLock(ctx, c, cluster, func(c *apiv1.Cluster) {
+			c.Status.MajorUpgradeStatus.PreUpgradeInstanceCount = c.Spec.Instances
+			c.Status.MajorUpgradeStatus.PostUpgradeBackupName = backupName
+		}); err != nil {
+			contextLogger.Error(err, "Unable to update Cluster's status with a MajorUpgradeStatus")
+			return nil, err
+		}
+	}
+
+	//TODO: should we skip backup if instance count was 1 in the beginning?
+	if cluster.Spec.Instances != 1 {
+		if err := resources.RetryWithRefreshedResource(ctx, c, cluster, func() error {
+			return c.Update(ctx, cluster)
+		}); err != nil {
+			contextLogger.Error(err, "Unable to update Cluster instance count")
+			return nil, err
+		}
+	}
+
+	// NOTE: we can't create backup here yet, because creating it too early will often makes backup fail
+	// when it attempts to backup freshly started instance
+	return nil, nil
+}
+
+// Possible return values:
+// - nil, err:  unexpected error
+// - nil, nil: no backup exists and no backup is expected to exist yet
+// - backup, nil: we either created or found existing backup
+func createOrGetPostUpgradeBackup(ctx context.Context, c client.Client, cluster *apiv1.Cluster, noInstancesIsAlive bool) (*apiv1.Backup, error) {
+	contextLogger := log.FromContext(ctx)
+	if backup, err := getPostUpgradeBackup(ctx, c, cluster); err == nil {
+		return backup, err
+	} else if !errors.IsNotFound(err) {
+		return nil, err
+	}
+
+	// At this moment know that post-upgrade backup was registered in the status, but it doesn't exist in the cluster.
+	// We should create it, but not before first instance comes alive, otherwise backup fails if unrecoverable error
+	if noInstancesIsAlive {
+		return nil, nil
+	}
+
+	backupMethod, ok := chooseBackupMethod(cluster)
+	if !ok { // Should not happen, because we checked it before registering backup
+		return nil, nil
+	}
+
+	backupName := cluster.Status.MajorUpgradeStatus.PostUpgradeBackupName
+
+	backup := apiv1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: cluster.Namespace},
+		Spec: apiv1.BackupSpec{
+			Cluster: apiv1.LocalObjectReference{Name: cluster.Name},
+			Method:  backupMethod,
+		},
+	}
+	utils.SetOperatorVersion(&backup.ObjectMeta, versions.Version)
+	utils.InheritAnnotations(&backup.ObjectMeta, cluster.Annotations,
+		cluster.GetFixedInheritedAnnotations(), configuration.Current)
+	utils.InheritLabels(&backup.ObjectMeta, cluster.Labels,
+		cluster.GetFixedInheritedLabels(), configuration.Current)
+	utils.SetAsOwnedBy(&backup.ObjectMeta, cluster.ObjectMeta, cluster.TypeMeta)
+
+	if err := c.Create(ctx, &backup); err != nil {
+		contextLogger.Error(err, "Unable to create post-upgrade backup")
+		return nil, err
+	}
 	return nil, nil
 }
 
@@ -260,6 +378,38 @@ func majorVersionUpgradeHandleCompletion(
 	return &ctrl.Result{Requeue: true}, nil
 }
 
+func postUpgradeBackupCompletion(ctx context.Context, c client.Client, cluster *apiv1.Cluster, noInstancesIsAlive bool) error {
+	contextLogger := log.FromContext(ctx)
+	backup, err := createOrGetPostUpgradeBackup(ctx, c, cluster, noInstancesIsAlive)
+	if err != nil {
+		contextLogger.Error(err, "Unable to create or get post-upgrade backup")
+		return err
+	}
+	if backup == nil {
+		return nil
+	}
+
+	if !backup.Status.IsDone() {
+		contextLogger.Debug("Waiting for the post-upgrade backup completion", "backup_name", backup.Name, "backup_phase", backup.Status.Phase)
+		return nil
+	}
+	contextLogger.Info("Post-upgrade backup completed, restoring original instance count and finalizing status updates")
+
+	cluster.Spec.Instances = cluster.Status.MajorUpgradeStatus.PreUpgradeInstanceCount
+	if err := c.Update(ctx, cluster); err != nil {
+		contextLogger.Error(err, "Unable to scale up cluster status after major upgrade completed.")
+		return err
+	}
+
+	if err := status.PatchWithOptimisticLock(ctx, c, cluster, func(cluster *apiv1.Cluster) {
+		cluster.Status.MajorUpgradeStatus = apiv1.MajorUpgradeStatus{}
+	}); err != nil {
+		contextLogger.Error(err, "Unable to update cluster status after major upgrade completed.")
+		return err
+	}
+	return nil
+}
+
 // registerPhase sets a phase into the cluster
 func registerPhase(
 	ctx context.Context,
@@ -291,4 +441,27 @@ func getPrimarySerial(
 	}
 
 	return 0, ErrNoPrimaryPVCFound
+}
+
+func chooseBackupMethod(cluster *apiv1.Cluster) (apiv1.BackupMethod, bool) {
+	walArchivingActive := (cluster.Spec.Backup != nil && cluster.Spec.Backup.BarmanObjectStore != nil) ||
+		cluster.GetEnabledWALArchivePluginName() != ""
+
+	// This backup won't be usable for replica initialization, so don't take it.
+	if !walArchivingActive {
+		return "", false
+	}
+
+	bSpec := cluster.Spec.Backup
+	if bSpec == nil {
+		return "", false
+	} else if bSpec.VolumeSnapshot != nil {
+		return apiv1.BackupMethodVolumeSnapshot, true
+	} else if bSpec.IsBarmanBackupConfigured() {
+		return apiv1.BackupMethodBarmanObjectStore, true
+	} else {
+		// It probably should be 'plugin', but this method is not set in a Cluster CR, but in Backup object
+		// FIXME: we should probably lookup latest Backup objects? Or even explicitly requires to specify backup config?
+		return "", false
+	}
 }

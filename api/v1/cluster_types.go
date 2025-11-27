@@ -1013,6 +1013,10 @@ type ClusterStatus struct {
 	// SystemID is the latest detected PostgreSQL SystemID
 	// +optional
 	SystemID string `json:"systemID,omitempty"`
+
+	// MajorUpgradeStatus is the status of major upgrade phase
+	// +optional
+	MajorUpgradeStatus MajorUpgradeStatus `json:"majorUpgradeStatus,omitempty"`
 }
 
 // ImageInfo contains the information about a PostgreSQL image
@@ -2557,6 +2561,17 @@ type ConfigMapResourceVersion struct {
 	// Map keys are the config map names, map values are the versions
 	// +optional
 	Metrics map[string]string `json:"metrics,omitempty"`
+}
+
+// PluginStatus is the status of a loaded plugin
+type MajorUpgradeStatus struct {
+	// PreUpgradeInstanceCount keeps initial instance count
+	// +optional
+	PreUpgradeInstanceCount int `json:"preUpgradeInstanceCount,omitempty"`
+
+	// Name of the backup to be taken after upgrade, but before starting replicas
+	// +optional
+	PostUpgradeBackupName string `json:"postUpgradeBackupName,omitempty"`
 }
 
 func init() {
