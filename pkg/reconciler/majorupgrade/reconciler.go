@@ -26,6 +26,7 @@ import (
 
 	"github.com/cloudnative-pg/cloudnative-pg/pkg/resources"
 	"github.com/cloudnative-pg/machinery/pkg/log"
+	pgTime "github.com/cloudnative-pg/machinery/pkg/postgres/time"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -200,8 +201,7 @@ func registerPostUpgradeBackup(ctx context.Context, c client.Client, cluster *ap
 	// registerPostUpgradeBackup call
 	if cluster.Status.MajorUpgradeStatus.PostUpgradeBackupName == "" {
 		instanceName := specs.GetInstanceName(cluster.Name, nodeSerial)
-		backupName = fmt.Sprintf("%s-%s", instanceName, "post-upgrade-backup")
-
+		backupName = fmt.Sprintf("%s-%s-%s", instanceName, "pubkp", pgTime.ToCompactISO8601(time.Now()))
 		if err := status.PatchWithOptimisticLock(ctx, c, cluster, func(c *apiv1.Cluster) {
 			c.Status.MajorUpgradeStatus.PreUpgradeInstanceCount = c.Spec.Instances
 			c.Status.MajorUpgradeStatus.PostUpgradeBackupName = backupName
